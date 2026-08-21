@@ -32,9 +32,15 @@ def register(mcp: FastMCP) -> None:
         since = recent_date_str(RECENT_ISSUES_DAYS)
         label = 'label:"good first issue"' if params.difficulty == "beginner" else 'label:"help wanted"'
         query_parts = [
-            f"language:{params.language}",
+            # The language is quoted so multi-word values survive: bare
+            # `language:Jupyter Notebook` is parsed by GitHub as
+            # `language:Jupyter` plus a free-text `Notebook`.
+            f'language:"{params.language}"',
             label,
             "state:open",
+            # /search/issues returns pull requests too, and a PR carrying the
+            # label would otherwise look like an issue to pick up.
+            "is:issue",
             f"created:>{since}",
             "is:public",
         ]
@@ -113,8 +119,8 @@ def register(mcp: FastMCP) -> None:
         try:
             result = await github_search(
                 "issues",
-                f'language:{primary_lang} label:"good first issue" state:open '
-                f'created:>{since} is:public',
+                f'language:"{primary_lang}" label:"good first issue" state:open '
+                f'is:issue created:>{since} is:public',
                 {"sort": "created", "order": "desc", "per_page": 10},
             )
         except Exception as e:
