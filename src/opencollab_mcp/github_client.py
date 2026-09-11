@@ -66,6 +66,33 @@ def clear_cache() -> None:
 
 # ---- HTTP -----------------------------------------------------------------
 
+# One client, one connection pool. Tools like repo_health and
+# generate_pr_plan fan out 3-5 requests through asyncio.gather, and a
+# per-request client paid a fresh TCP + TLS handshake for every one of them.
+_client: httpx.AsyncClient | None = None
+
+
+def _get_client() -> httpx.AsyncClient:
+    """Return the shared client, creating it on first use."""
+    global _client
+    if _client is None or _client.is_closed:
+        _client = httpx.AsyncClient(timeout=DEFAULT_TIMEOUT)
+    return _client
+
+
+def reset_client() -> None:
+    """Drop the shared client so the next request builds a fresh one.
+
+    Useful for tests, in the same way as clear_cache(): a test that installs a
+    mock transport by patching httpx.AsyncClient needs the next request to go
+    through the patch rather than reuse a client built earlier. The old client
+    is not awaited closed — it holds only idle pooled connections, and this is
+    not a production code path.
+    """
+    global _client
+    _client = None
+
+
 def _get_headers() -> dict[str, str]:
     """Build auth headers from environment."""
     token = os.environ.get("GITHUB_TOKEN", "")
@@ -96,25 +123,24 @@ async def github_get(
         if cached is not None:
             return cached
 
-    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
-        resp = await client.get(
-            f"{GITHUB_API_BASE}{path}",
-            headers=_get_headers(),
-            params=params or {},
-        )
+    resp = await _get_client().get(
+        f"{GITHUB_API_BASE}{path}",
+        headers=_get_headers(),
+        params=params or {},
+    )
 
-        # GitHub returns 202 with empty body while it computes statistics
-        # (commit_activity, participation, contributors on cold repos).
-        if resp.status_code == 202:
-            logger.info("GitHub returned 202 (stats computing) for %s", path)
-            return {}
+    # GitHub returns 202 with empty body while it computes statistics
+    # (commit_activity, participation, contributors on cold repos).
+    if resp.status_code == 202:
+        logger.info("GitHub returned 202 (stats computing) for %s", path)
+        return {}
 
-        resp.raise_for_status()
-        try:
-            data = resp.json()
-        except ValueError:
-            logger.warning("Non-JSON response from %s", path)
-            return {}
+    resp.raise_for_status()
+    try:
+        data = resp.json()
+    except ValueError:
+        logger.warning("Non-JSON response from %s", path)
+        return {}
 
     if use_cache:
         _cache_set(key, data)
@@ -131,6 +157,26 @@ async def github_search(
     return await github_get(f"/search/{endpoint}", merged)
 
 
+def _reset_hint(response: httpx.Response) -> str:
+    """" Resets in ~N minutes." for a usable x-ratelimit-reset, else "".
+
+    The header is a Unix epoch timestamp. A missing, unparseable or already
+    past value yields nothing rather than a nonsense "resets in -3 minutes":
+    a vague message beats a wrong one.
+    """
+    raw = response.headers.get("x-ratelimit-reset", "")
+    try:
+        reset_at = int(raw)
+    except ValueError:
+        return ""
+    seconds = reset_at - time.time()
+    if seconds <= 0:
+        return ""
+    if seconds < 60:
+        return " Resets in under a minute."
+    return f" Resets in ~{round(seconds / 60)} minutes."
+
+
 def handle_github_error(e: Exception) -> str:
     """Return a human-friendly error string for GitHub API failures.
 
@@ -144,11 +190,19 @@ def handle_github_error(e: Exception) -> str:
         if code == 401:
             return ("Error: GitHub authentication failed. "
                     "Check your GITHUB_TOKEN environment variable.")
-        if code == 403:
-            remaining = e.response.headers.get("x-ratelimit-remaining", "?")
-            return (f"Error: GitHub API rate limit or permission issue "
-                    f"(remaining: {remaining}). Try again later or use a "
-                    f"token with more scopes.")
+        if code in (403, 429):
+            # GitHub says which of the two a 403 is: exhausted quota leaves
+            # x-ratelimit-remaining at "0", anything else is a permissions
+            # problem. Reporting them together sent people to check the wrong
+            # thing half the time. 429 is always a limit (secondary limits).
+            remaining = e.response.headers.get("x-ratelimit-remaining", "")
+            if code == 429 or remaining == "0":
+                return (f"Error: GitHub API rate limit exceeded."
+                        f"{_reset_hint(e.response)} Set GITHUB_TOKEN for a "
+                        f"5,000 requests/hour limit.")
+            return ("Error: GitHub denied access (403). Your token may be "
+                    "missing the 'public_repo' scope, or the resource is "
+                    "private.")
         if code == 404:
             return "Error: Resource not found on GitHub. Double-check the username or repo name."
         if code == 422:
